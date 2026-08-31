@@ -100,6 +100,22 @@ fi
 echo "Found ${#FORKS[@]} fork(s) to process."
 DATE=$(date -u +%Y-%m-%d)
 
+# Delete all stale sync branches (update/upstream-*) in the fork.
+# Called only after a successful merge or when the fork is already up to date.
+function cleanup_old_branches() {
+  local fork_full="$1"
+  local branches b
+  branches=$(gh api "/repos/${fork_full}/branches?per_page=100" --jq '.[].name' 2>/dev/null | grep "^${BRANCH_PREFIX}-" || true)
+  if [[ -z "$branches" ]]; then
+    return
+  fi
+  while IFS= read -r b; do
+    [[ -z "$b" ]] && continue
+    echo "Deleting stale sync branch ${b} in ${fork_full}"
+    gh api -X DELETE "/repos/${fork_full}/git/refs/heads/${b}" >/dev/null 2>&1 || echo "WARNING: failed to delete branch ${b} in ${fork_full}."
+  done <<< "$branches"
+}
+
 # Export variables used by process_fork in parallel workers (xargs spawns new shells)
 export WORKROOT DATE DRY_RUN BRANCH_PREFIX PR_TITLE_TEMPLATE PR_BODY_TEMPLATE
 
@@ -153,7 +169,20 @@ function process_fork() {
   owner=$(echo "$fork_full" | cut -d/ -f1)
   existing_prs=$(gh pr list --repo "$fork_full" --head "${owner}:${BRANCH}" --state open --json number --jq '.[].number' || true)
   if [[ -n "$existing_prs" ]]; then
-    echo "An open PR already exists for ${fork_full} branch ${BRANCH}: ${existing_prs}. Skipping PR creation."
+    echo "An open PR already exists for ${fork_full} branch ${BRANCH}: ${existing_prs}. Trying to merge it..."
+    for pr_number in $existing_prs; do
+      mergeable=$(gh pr view "$pr_number" --repo "$fork_full" --json mergeable --jq '.mergeable' 2>/dev/null || echo "UNKNOWN")
+      if [[ "$mergeable" == "MERGEABLE" ]]; then
+        if gh pr merge "$pr_number" --repo "$fork_full" --merge --delete-branch >/dev/null 2>&1; then
+          echo "Merged existing PR #${pr_number} in ${fork_full}."
+          cleanup_old_branches "$fork_full"
+        else
+          echo "WARNING: auto-merge failed for existing PR #${pr_number} in ${fork_full}. Left open."
+        fi
+      else
+        echo "Existing PR #${pr_number} in ${fork_full} is not mergeable (conflicts). Left open for manual review."
+      fi
+    done
     popd >/dev/null
     rm -rf "$WORKDIR"
     return
@@ -167,14 +196,36 @@ function process_fork() {
   PR_BODY=${PR_BODY//\{DATE\}/${DATE}}
 
   echo "Creating PR in ${fork_full}: ${PR_TITLE}"
-  gh pr create --repo "$fork_full" --head "${owner}:${BRANCH}" --base "$fork_default_branch" --title "$PR_TITLE" --body "$PR_BODY" >/dev/null || echo "Failed to create PR for ${fork_full}"
+  if ! pr_url=$(gh pr create --repo "$fork_full" --head "${owner}:${BRANCH}" --base "$fork_default_branch" --title "$PR_TITLE" --body "$PR_BODY" 2>/dev/null); then
+    echo "Failed to create PR for ${fork_full}, leaving branch for manual review."
+    popd >/dev/null
+    rm -rf "$WORKDIR"
+    return
+  fi
+  echo "PR created: ${pr_url}"
+
+  # Auto-merge: only works when GitHub reports the PR as mergeable (no conflicts).
+  pr_number=$(gh pr view --repo "$fork_full" --json number --jq '.number')
+  mergeable=$(gh pr view "$pr_number" --repo "$fork_full" --json mergeable --jq '.mergeable')
+  if [[ "$mergeable" == "MERGEABLE" ]]; then
+    echo "Auto-merging PR #${pr_number} in ${fork_full}..."
+    if gh pr merge "$pr_number" --repo "$fork_full" --merge --delete-branch >/dev/null 2>&1; then
+      echo "Merged PR #${pr_number} in ${fork_full}."
+      cleanup_old_branches "$fork_full"
+    else
+      echo "WARNING: auto-merge failed for ${fork_full} (branch protection or checks). PR left open: ${pr_url}"
+    fi
+  else
+    echo "PR #${pr_number} in ${fork_full} has conflicts or is not mergeable yet. Left open for manual review: ${pr_url}"
+  fi
 
   popd >/dev/null
   rm -rf "$WORKDIR"
 }
 
-# Make the function visible to parallel worker shells
+# Make the functions visible to parallel worker shells
 export -f process_fork
+export -f cleanup_old_branches
 
 if [[ "$PARALLEL" -gt 1 ]]; then
   printf "%s\n" "${FORKS[@]}" | xargs -n1 -P "$PARALLEL" -I{} bash -c 'process_fork "$@"' _ {} \

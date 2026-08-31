@@ -1,8 +1,16 @@
 # Centralized fork sync
 
 This repository contains a centralized script and workflow to synchronize your forks with their upstream repositories:
-- `sync-forks.sh` — main script. Lists forks, clones each fork, creates a branch from the upstream default branch, pushes it to the fork and opens a PR.
+- `sync-forks.sh` — main script. Lists forks, clones each fork, creates a branch from the upstream default branch, pushes it to the fork, opens a PR and **auto-merges it** when there are no conflicts.
 - `.github/workflows/sync-forks.yml` — CI that runs the script on schedule (or manually).
+
+How it works
+1. For each fork the script detects the upstream (parent) repository and its default branch.
+2. A sync branch `update/upstream-YYYYMMDD` is created from the upstream default branch and pushed to the fork.
+3. A PR is opened against the fork's default branch (`main`).
+4. If GitHub reports the PR as mergeable (no conflicts), it is **merged automatically** and the sync branch is deleted.
+5. If there are conflicts, the PR stays open for manual review.
+6. After a successful merge, all stale `update/upstream-*` branches are cleaned up in the fork.
 
 Quick setup
 1. Add files above to the repository root and commit.
@@ -31,7 +39,8 @@ Customization
 Security notes
 - Keep the PAT secret and do not expose it.
 - The PAT must belong to an account that has push rights to the forks (ideally your account).
-- Review PRs before merging; this workflow intentionally opens PRs (not auto-merges) to avoid conflicts and unintended overwrites.
+- Auto-merge is applied only when GitHub reports the PR as conflict-free; conflicting PRs stay open for manual review.
+- If you prefer manual review for everything, remove the `gh pr merge` block from `sync-forks.sh`.
 
 Troubleshooting
 - `Push failed for <fork>` — check that the PAT has `repo` scope and belongs to an account with push access to the forks.

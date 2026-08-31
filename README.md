@@ -33,7 +33,7 @@ Security notes
 - The PAT must belong to an account that has push rights to the forks (ideally your account).
 - Review PRs before merging; this workflow intentionally opens PRs (not auto-merges) to avoid conflicts and unintended overwrites.
 
-If you want, I can:
-- Add labels/reviewers/assignees to created PRs,
-- Change schedule or concurrency,
-- Provide a small action to automatically close stale sync PRs.
+Troubleshooting
+- `Push failed for <fork>` — check that the PAT has `repo` scope and belongs to an account with push access to the forks.
+- `No upstream parent detected` — the repository is not a fork; it is skipped automatically.
+- Parallel mode requires bash; the script exports `process_fork` for `xargs` workers automatically.

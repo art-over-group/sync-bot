@@ -10,11 +10,11 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # Defaults
-USER=""
+GH_USER=""
 REPOS_FILE=""
 DRY_RUN=false
 PARALLEL=1
-TMPDIR=$(mktemp -d)
+WORKROOT=$(mktemp -d)
 PR_TITLE_TEMPLATE="chore(sync): update from upstream/{UPSTREAM_BRANCH}"
 PR_BODY_TEMPLATE="Automated sync from upstream repository {UPSTREAM_FULL} ({UPSTREAM_BRANCH}) on {DATE}."
 BRANCH_PREFIX="update/upstream"
@@ -39,7 +39,7 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --user) USER="$2"; shift 2;;
+    --user) GH_USER="$2"; shift 2;;
     --repos-file) REPOS_FILE="$2"; shift 2;;
     --dry-run) DRY_RUN=true; shift;;
     --parallel) PARALLEL="$2"; shift 2;;
@@ -48,7 +48,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$USER" ]]; then
+if [[ -z "$GH_USER" ]]; then
   echo "Missing --user"
   usage
 fi
@@ -67,30 +67,41 @@ fi
 
 export GITHUB_TOKEN="${!GH_CLI_TOKEN_ENV}"
 
+# Basic-auth header for authenticated git push (the token never appears in URLs or logs)
+AUTH_HEADER="Authorization: Basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+export AUTH_HEADER
+
 declare -a FORKS=()
 if [[ -n "$REPOS_FILE" ]]; then
+  if [[ ! -f "$REPOS_FILE" ]]; then
+    echo "Repos file not found: $REPOS_FILE"
+    exit 2
+  fi
   mapfile -t FORKS < "$REPOS_FILE"
 else
-  echo "Listing forks for user $USER..."
+  echo "Listing forks for user $GH_USER..."
   PAGE=1
   while true; do
-    out=$(gh api -H "Accept: application/vnd.github+json" "/users/${USER}/repos?type=forks&per_page=100&page=${PAGE}")
+    out=$(gh api -H "Accept: application/vnd.github+json" "/users/${GH_USER}/repos?type=forks&per_page=100&page=${PAGE}")
     if [[ $(echo "$out" | jq 'length') -eq 0 ]]; then
       break
     fi
     mapfile -t page_forks < <(echo "$out" | jq -r '.[].full_name')
     FORKS+=("${page_forks[@]}")
-    ((PAGE++))
+    PAGE=$((PAGE + 1))
   done
 fi
 
 if [[ ${#FORKS[@]} -eq 0 ]]; then
-  echo "No forks found for user ${USER}."
+  echo "No forks found for user ${GH_USER}."
   exit 0
 fi
 
 echo "Found ${#FORKS[@]} fork(s) to process."
 DATE=$(date -u +%Y-%m-%d)
+
+# Export variables used by process_fork in parallel workers (xargs spawns new shells)
+export WORKROOT DATE DRY_RUN BRANCH_PREFIX PR_TITLE_TEMPLATE PR_BODY_TEMPLATE
 
 function process_fork() {
   local fork_full="$1"
@@ -111,10 +122,13 @@ function process_fork() {
     return
   fi
 
-  upstream_default_branch=$(gh api -H "Accept: application/vnd.github+json" "/repos/${parent_full}" | jq -r '.default_branch // "main"')
+  upstream_default_branch=$(gh api -H "Accept: application/vnd.github+json" "/repos/${parent_full}" | jq -r '.default_branch // "main"') || true
+  if [[ -z "$upstream_default_branch" ]]; then
+    upstream_default_branch="main"
+  fi
   echo "Upstream: ${parent_full} (branch: ${upstream_default_branch}), fork default branch: ${fork_default_branch}"
 
-  WORKDIR="${TMPDIR}/$(echo $fork_full | tr / -)-${RANDOM}"
+  WORKDIR="${WORKROOT}/$(echo "$fork_full" | tr / -)-${RANDOM}"
   mkdir -p "$WORKDIR"
   git clone --depth=1 "https://github.com/${fork_full}.git" "$WORKDIR" || { echo "Clone failed for ${fork_full}"; rm -rf "$WORKDIR"; return; }
   pushd "$WORKDIR" >/dev/null
@@ -134,7 +148,7 @@ function process_fork() {
   fi
 
   echo "Pushing branch ${BRANCH} -> origin"
-  git push --set-upstream origin "$BRANCH" -q || { echo "Push failed for ${fork_full}"; popd >/dev/null; rm -rf "$WORKDIR"; return; }
+  git -c http.extraHeader="$AUTH_HEADER" push --force --set-upstream origin "$BRANCH" -q || { echo "Push failed for ${fork_full}"; popd >/dev/null; rm -rf "$WORKDIR"; return; }
 
   owner=$(echo "$fork_full" | cut -d/ -f1)
   existing_prs=$(gh pr list --repo "$fork_full" --head "${owner}:${BRANCH}" --state open --json number --jq '.[].number' || true)
@@ -159,13 +173,17 @@ function process_fork() {
   rm -rf "$WORKDIR"
 }
 
+# Make the function visible to parallel worker shells
+export -f process_fork
+
 if [[ "$PARALLEL" -gt 1 ]]; then
-  printf "%s\n" "${FORKS[@]}" | xargs -n1 -P "$PARALLEL" -I{} bash -c 'process_fork "$@"' _ {}
+  printf "%s\n" "${FORKS[@]}" | xargs -n1 -P "$PARALLEL" -I{} bash -c 'process_fork "$@"' _ {} \
+    || echo "WARNING: some forks failed to process."
 else
   for f in "${FORKS[@]}"; do
-    process_fork "$f"
+    process_fork "$f" || echo "WARNING: failed to process ${f}."
   done
 fi
 
 echo "All done."
-rm -rf "$TMPDIR"
+rm -rf "$WORKROOT"

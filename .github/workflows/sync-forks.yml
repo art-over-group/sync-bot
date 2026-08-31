@@ -1,0 +1,37 @@
+name: Centralized sync forks
+
+on:
+  schedule:
+    - cron: "0 2 * * 1" # еженедельно по понедельникам 02:00 UTC
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update -y
+          sudo apt install -y jq curl gnupg
+          # Install gh CLI
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt update -y
+          sudo apt install -y gh
+
+      - name: Add script
+        run: |
+          chmod +x ./sync-forks.sh
+
+      - name: Run centralized sync
+        env:
+          MAINTAINER_TOKEN: ${{ secrets.MAINTAINER_TOKEN }}
+        run: |
+          ./sync-forks.sh --user art-over-group --parallel 4

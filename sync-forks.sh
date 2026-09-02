@@ -5,6 +5,7 @@
 #  ./sync-forks.sh --user art-over-group        # process all forks of user
 #  ./sync-forks.sh --user art-over-group --repos-file my_forks.txt
 #  ./sync-forks.sh --user art-over-group --dry-run
+#  ./sync-forks.sh --user art-over-group --direct-push  # update main branch directly (no PR)
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -14,6 +15,7 @@ GH_USER=""
 REPOS_FILE=""
 DRY_RUN=false
 PARALLEL=1
+DIRECT_PUSH=false
 WORKROOT=$(mktemp -d)
 PR_TITLE_TEMPLATE="chore(sync): update from upstream/{UPSTREAM_BRANCH}"
 PR_BODY_TEMPLATE="Automated sync from upstream repository {UPSTREAM_FULL} ({UPSTREAM_BRANCH}) on {DATE}."
@@ -22,13 +24,14 @@ GH_CLI_TOKEN_ENV="MAINTAINER_TOKEN"
 
 function usage() {
   cat <<EOF
-Usage: $0 --user <github-username> [--repos-file <file>] [--dry-run] [--parallel N]
+Usage: $0 --user <github-username> [--repos-file <file>] [--dry-run] [--parallel N] [--direct-push]
 
 Options:
   --user USER            GitHub username whose forks to process (required)
   --repos-file FILE      File with newline-separated fork full names (owner/repo). If omitted, script lists user's forks via gh.
   --dry-run              Don't push or create PRs; just show what would be done.
   --parallel N           Number of parallel workers (default 1).
+  --direct-push          Update the default branch directly instead of creating PRs (faster sync, no PR review).
 Environment:
   Export $GH_CLI_TOKEN_ENV with a PAT that has 'repo' scope (write access to your forks).
 Requirements:
@@ -42,6 +45,7 @@ while [[ $# -gt 0 ]]; do
     --user) GH_USER="$2"; shift 2;;
     --repos-file) REPOS_FILE="$2"; shift 2;;
     --dry-run) DRY_RUN=true; shift;;
+    --direct-push) DIRECT_PUSH=true; shift;;
     --parallel) PARALLEL="$2"; shift 2;;
     --help) usage;;
     *) echo "Unknown arg: $1"; usage;;
@@ -117,7 +121,7 @@ function cleanup_old_branches() {
 }
 
 # Export variables used by process_fork in parallel workers (xargs spawns new shells)
-export WORKROOT DATE DRY_RUN BRANCH_PREFIX PR_TITLE_TEMPLATE PR_BODY_TEMPLATE
+export WORKROOT DATE DRY_RUN BRANCH_PREFIX PR_TITLE_TEMPLATE PR_BODY_TEMPLATE DIRECT_PUSH
 
 function process_fork() {
   local fork_full="$1"
@@ -152,16 +156,50 @@ function process_fork() {
   git remote add upstream "https://github.com/${parent_full}.git" 2>/dev/null || true
   git fetch upstream --depth=1 || { echo "Failed to fetch upstream for ${fork_full}"; popd >/dev/null; rm -rf "$WORKDIR"; return; }
 
-  BRANCH="${BRANCH_PREFIX}-$(date -u +%Y%m%d)"
-
-  git checkout -b "$BRANCH" "upstream/${upstream_default_branch}" || { echo "Failed to checkout upstream branch for ${fork_full}"; popd >/dev/null; rm -rf "$WORKDIR"; return; }
-
   if $DRY_RUN; then
-    echo "[dry-run] Would push branch ${BRANCH} to ${fork_full} and create PR."
+    if $DIRECT_PUSH; then
+      echo "[dry-run] Would directly push ${upstream_default_branch} to ${fork_full}/${fork_default_branch}."
+    else
+      echo "[dry-run] Would create branch and PR for ${fork_full}."
+    fi
     popd >/dev/null
     rm -rf "$WORKDIR"
     return
   fi
+
+  # ===== DIRECT PUSH MODE =====
+  if $DIRECT_PUSH; then
+    echo "Direct push mode: updating ${fork_default_branch} directly from upstream/${upstream_default_branch}..."
+    
+    # Get the commit SHA of upstream default branch
+    upstream_sha=$(git rev-parse "upstream/${upstream_default_branch}")
+    fork_sha=$(git rev-parse "origin/${fork_default_branch}" 2>/dev/null || echo "")
+    
+    if [[ "$upstream_sha" == "$fork_sha" ]]; then
+      echo "${fork_full} is already up to date with upstream (both at ${upstream_sha:0:7})."
+      cleanup_old_branches "$fork_full"
+      popd >/dev/null
+      rm -rf "$WORKDIR"
+      return
+    fi
+    
+    echo "Updating ${fork_full}/${fork_default_branch}: ${fork_sha:0:7} → ${upstream_sha:0:7}"
+    if git -c http.extraHeader="$AUTH_HEADER" push origin "upstream/${upstream_default_branch}:${fork_default_branch}" --force -q; then
+      echo "✅ Successfully updated ${fork_full}/${fork_default_branch}"
+      cleanup_old_branches "$fork_full"
+    else
+      echo "❌ Failed to push to ${fork_full}/${fork_default_branch}"
+    fi
+    
+    popd >/dev/null
+    rm -rf "$WORKDIR"
+    return
+  fi
+
+  # ===== PR MODE (original behavior) =====
+  BRANCH="${BRANCH_PREFIX}-$(date -u +%Y%m%d)"
+
+  git checkout -b "$BRANCH" "upstream/${upstream_default_branch}" || { echo "Failed to checkout upstream branch for ${fork_full}"; popd >/dev/null; rm -rf "$WORKDIR"; return; }
 
   echo "Pushing branch ${BRANCH} -> origin"
   git -c http.extraHeader="$AUTH_HEADER" push --force --set-upstream origin "$BRANCH" -q || { echo "Push failed for ${fork_full}"; popd >/dev/null; rm -rf "$WORKDIR"; return; }

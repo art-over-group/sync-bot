@@ -24,9 +24,9 @@ jobs:
           git --version
           jq --version
 
-      - name: Run centralized sync
+      - name: Run centralized sync (direct push mode)
         env:
           MAINTAINER_TOKEN: ${{ secrets.MAINTAINER_TOKEN }}
         run: |
           chmod +x ./sync-forks.sh
-          ./sync-forks.sh --user art-over-group --parallel 4
+          ./sync-forks.sh --user art-over-group --direct-push --parallel 4

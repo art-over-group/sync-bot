@@ -2,7 +2,7 @@ name: Centralized sync forks
 
 on:
   schedule:
-    - cron: "0 2 * * 1" # еженедельно по понедельникам 02:00 UTC
+    - cron: "0 2 * * 1"
   workflow_dispatch:
 
 concurrency:
@@ -13,10 +13,17 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install GitHub CLI
+        run: |
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo gpg --dearmor -o /usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y gh
 
       - name: Verify dependencies
         run: |
@@ -24,9 +31,9 @@ jobs:
           git --version
           jq --version
 
-      - name: Run centralized sync (direct push mode)
+      - name: Run centralized sync (PR mode)
         env:
           MAINTAINER_TOKEN: ${{ secrets.MAINTAINER_TOKEN }}
         run: |
           chmod +x ./sync-forks.sh
-          ./sync-forks.sh --user art-over-group --direct-push --parallel 4
+          ./sync-forks.sh --user art-over-group --parallel 4
